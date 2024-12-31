@@ -6,23 +6,18 @@ import os
 import re
 import json
 import logging
-import mimetypes
 import asyncio
 import io
 import PIL.Image
+import base64
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="?", intents=intents)
-
 channel_contexts = {}
 ACTIVATED_CHANNELS_FILE = "activated_channels.json"
-IMAGE_MIME_TYPES = ["image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"]
-AUDIO_MIME_TYPES = ["audio/wav", "audio/mp3", "audio/aiff", "audio/aac", "audio/ogg", "audio/flac"]
 DISCORD_MESSAGE_LENGTH_LIMIT = 2000
 
 def load_activated_channels():
@@ -53,43 +48,59 @@ async def on_ready():
     setup_gemini_api()
 
 async def process_attachment(attachment):
-    mime_type = mimetypes.guess_type(attachment.filename)[0]
-    if mime_type in IMAGE_MIME_TYPES:
-        if attachment.size < 20 * 1024 * 1024:
+    """Traite une pièce jointe et renvoie un dictionnaire compatible avec l'API Gemini."""
+    try:
+        file_data = await attachment.read()
+        if attachment.content_type.startswith('image/'):
+            if attachment.size >= 20 * 1024 * 1024:
+                return "FileTooLarge"
+
             try:
-                image_data = await attachment.read()
-                image = PIL.Image.open(io.BytesIO(image_data))
-                return {"mime_type": mime_type, "data": image_data}
+                with PIL.Image.open(io.BytesIO(file_data)) as img:
+                    with io.BytesIO() as output_buffer:
+                        img.save(output_buffer, format="PNG")
+                        png_data = output_buffer.getvalue()
+
+                return {
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(png_data).decode("utf-8")
+                }
             except Exception as e:
-                logger.error(f"Erreur lors de la lecture de l'image {attachment.filename}: {e}")
-                return None
+                logger.error(f"Erreur lors du traitement de l'image {attachment.filename}: {e}")
+                return "ImageError"
+
+        elif attachment.content_type.startswith('audio/'):
+            if attachment.size >= 20 * 1024 * 1024:
+                return "FileTooLarge"
+            return {
+                "mime_type": attachment.content_type,
+                "data": base64.b64encode(file_data).decode("utf-8")
+            }
+        elif attachment.content_type == 'text/plain' or (attachment.content_type and attachment.content_type.startswith("application/")):
+          if attachment.size >= 20 * 1024 * 1024:
+              return "FileTooLarge"
+          try:
+              decoded_text = file_data.decode("utf-8")
+              return {"mime_type": "text/plain", "data": decoded_text}
+          except UnicodeDecodeError:
+              logger.error(
+                  f"Erreur de décodage du fichier {attachment.filename}. Assurez-vous qu'il est encodé en UTF-8."
+              )
+              return "DecodingError"
+        elif attachment.content_type == 'video/mp4':
+            if attachment.size >= 20 * 1024 * 1024:
+                return "FileTooLarge"
+            return {
+                "mime_type": "video/mp4",
+                "data": base64.b64encode(file_data).decode("utf-8")
+            }
         else:
-            logger.warning(f"Image {attachment.filename} trop grande (plus de 20MB).")
-            return "FileTooLarge"
-    elif mime_type in AUDIO_MIME_TYPES:
-        if attachment.size < 20 * 1024 * 1024:
-            audio_data = await attachment.read()
-            return {"mime_type": mime_type, "data": audio_data}
-        else:
-            logger.warning(f"Audio {attachment.filename} trop grand (plus de 20MB).")
-            return "FileTooLarge"
-    elif mime_type == "text/plain" or (mime_type and mime_type.startswith("application/")):
-        if attachment.size < 20 * 1024 * 1024:
-            file_data = await attachment.read()
-            try:
-                decoded_text = file_data.decode("utf-8")
-                return f"{attachment.filename}:\n{decoded_text}"
-            except UnicodeDecodeError:
-                logger.error(
-                    f"Erreur de décodage du fichier {attachment.filename}. Assurez-vous qu'il est encodé en UTF-8."
-                )
-                return "DecodingError"
-        else:
-            logger.warning(f"Fichier {attachment.filename} trop grand (plus de 20MB).")
-            return "FileTooLarge"
-    else:
-        logger.warning(f"Type de fichier non pris en charge pour {attachment.filename}: {mime_type}")
-        return None
+            logger.warning(f"Type de fichier non pris en charge pour {attachment.filename}: {attachment.content_type}")
+            return "UnsupportedType"
+
+    except Exception as e:
+        logger.error(f"Erreur lors de la lecture de la pièce jointe {attachment.filename}: {e}")
+        return "ReadError"
 
 @bot.event
 async def on_message(message):
@@ -108,81 +119,92 @@ async def on_message(message):
     if re.match(r"^\W", message.content):
         logger.info("on_message: Message ignoré (caractère non-alphanumérique au début, mais pas une commande)")
         return
+
     context = get_channel_context(message.channel.id)
     if context is None:
         logger.info(f"on_message: Bot désactivé dans le channel {message.channel.id}, message ignoré")
         return
 
-    final_parts = []
+    message_parts = [{"text": f"{message.author.display_name}: {message.content}"}]
     file_too_large = False
-    final_parts.append(f"{message.author.display_name}: {message.content}")
+    unsupported_type = False
+    decoding_error = False
+    image_error = False
+    read_error = False
+
     for attachment in message.attachments:
         attachment_data = await process_attachment(attachment)
         if attachment_data == "FileTooLarge":
             file_too_large = True
+        elif attachment_data == "UnsupportedType":
+            unsupported_type = True
         elif attachment_data == "DecodingError":
-            await message.channel.send(f"Erreur de décodage du fichier {attachment.filename}. Assurez-vous qu'il est encodé en UTF-8.")
-        elif attachment_data:
-            if isinstance(attachment_data, str):
-                final_parts.append(attachment_data)
-            else:
-                final_parts.append(attachment_data)
+            decoding_error = True
+        elif attachment_data == "ImageError":
+            image_error = True
+        elif attachment_data == "ReadError":
+            read_error = True
+        elif isinstance(attachment_data, dict):
+            message_parts.append(attachment_data)
         else:
-            await message.channel.send(f"Le fichier '{attachment.filename}' n'est pas pris en charge.")
+            logger.error(f"on_message: Traitement de pièce jointe non géré: {attachment_data}")
 
     if file_too_large:
         await message.channel.send("Certaines pièces jointes sont trop volumineuses (plus de 20MB) et ont été ignorées.")
+    if unsupported_type:
+        await message.channel.send("Certains types de fichiers ne sont pas pris en charge et ont été ignorés.")
+    if decoding_error:
+        await message.channel.send("Erreur de décodage de certains fichiers texte. Assurez-vous qu'ils sont encodés en UTF-8.")
+    if image_error:
+        await message.channel.send("Erreur lors du traitement de certaines images.")
+    if read_error:
+        await message.channel.send("Erreur lors de la lecture de certaines pièces jointes.")
 
-    logger.info(f"on_message: Ajout du message au contexte: {final_parts}")  # Debug 1
-    context.add_message("user", final_parts)
+    if not message_parts:
+      return
+
+    logger.info(f"on_message: Ajout du message au contexte: {message_parts}")
+    context.add_message("user", message_parts)
 
     try:
-        logger.info("on_message: Appel de generate_response")  # Debug 2
+        logger.info("on_message: Appel de generate_response")
         response = generate_response(context.get_context(), context.model_name, context.system_prompt)
         response_text = ""
         sent_message = None
-        logger.info("on_message: Début de la boucle de réception des chunks")  # Debug 3
+        logger.info("on_message: Début de la boucle de réception des chunks")
         for chunk in response:
-            logger.info(f"on_message: Chunk reçu: {chunk.text}")  # Debug 4
-
-            # Vérification AVANT d'ajouter le chunk
+            logger.info(f"on_message: Chunk reçu: {chunk.text}")
             if sent_message and len(response_text) + len(chunk.text) > DISCORD_MESSAGE_LENGTH_LIMIT - 3:
-                logger.info("on_message: Envoi du message actuel car le prochain chunk ferait dépasser la limite")  # Debug 6
+                logger.info("on_message: Envoi du message actuel car le prochain chunk ferait dépasser la limite")
                 await sent_message.edit(content=response_text)
                 sent_message = await message.channel.send("...")
                 response_text = ""
-
             response_text += chunk.text
-
             if sent_message:
-                logger.info(f"on_message: Modification du message existant: {sent_message.content}")  # Debug 5
+                logger.info(f"on_message: Modification du message existant: {sent_message.content}")
                 if len(response_text) <= DISCORD_MESSAGE_LENGTH_LIMIT - 3:
                     await sent_message.edit(content=response_text + "...")
                 else:
-                  # Cas où le chunk seul est trop long
-                  logger.info("on_message: Envoi d'un nouveau message car le chunk seul est trop long")
-                  await sent_message.edit(content=response_text)
-                  response_text = ""
-                  sent_message = None
+                    logger.info("on_message: Envoi d'un nouveau message car le chunk seul est trop long")
+                    await sent_message.edit(content=response_text)
+                    response_text = ""
+                    sent_message = None
             else:
-                logger.info("on_message: Envoi d'un nouveau message")  # Debug 7
+                logger.info("on_message: Envoi d'un nouveau message")
                 sent_message = await message.channel.send(response_text + "...")
             await asyncio.sleep(0.5)
-
-        logger.info("on_message: Fin de la boucle de réception des chunks")  # Debug 8
+        logger.info("on_message: Fin de la boucle de réception des chunks")
         if sent_message:
-          if response_text:
-            await sent_message.edit(content=response_text)
-          else:
-            await sent_message.delete()
+            if response_text:
+                await sent_message.edit(content=response_text)
+            else:
+                await sent_message.delete()
         elif response_text:
-          await message.channel.send(response_text)
-
-        logger.info(f"on_message: Ajout de la réponse au contexte: {response_text}")  # Debug 9
+            await message.channel.send(response_text)
+        logger.info(f"on_message: Ajout de la réponse au contexte: {response_text}")
         context.add_message("model", response_text)
-
     except Exception as e:
-        logger.error(f"on_message: Une erreur est survenue: {e}")  # Debug 10
+        logger.error(f"on_message: Une erreur est survenue: {e}")
         error_message = handle_api_error(e)
         await message.channel.send(f"Une erreur est survenue: {error_message}")
 

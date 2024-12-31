@@ -69,8 +69,11 @@ class ChannelContext:
                             decoded_parts.append(part)
                         elif isinstance(part["data"], str):
                             try:
-                                decoded_data = base64.b64decode(part["data"])
-                                decoded_parts.append({"mime_type": part["mime_type"], "data": decoded_data})
+                                if part["mime_type"] in ["image/png", "image/jpeg", "image/heic", "image/heif", "image/webp", "audio/wav", "audio/mp3", "audio/aiff", "audio/aac", "audio/ogg", "audio/flac"]:
+                                    decoded_data = base64.b64decode(part["data"])
+                                    decoded_parts.append({"mime_type": part["mime_type"], "data": decoded_data})
+                                else:
+                                    decoded_parts.append(part)
                             except Exception as e:
                                 print(f"Erreur lors du décodage base64 : {e}")
                                 decoded_parts.append(part)
