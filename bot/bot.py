@@ -10,11 +10,15 @@ import asyncio
 import io
 import PIL.Image
 import base64
+from discord.ext import voice_recv
+import wave
+from utils.audio import VoiceRecorder
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 intents = discord.Intents.default()
 intents.message_content = True
+intents.voice_states = True
 bot = commands.Bot(command_prefix="?", intents=intents)
 channel_contexts = {}
 ACTIVATED_CHANNELS_FILE = "activated_channels.json"
@@ -48,19 +52,16 @@ async def on_ready():
     setup_gemini_api()
 
 async def process_attachment(attachment):
-    """Traite une pièce jointe et renvoie un dictionnaire compatible avec l'API Gemini."""
     try:
         file_data = await attachment.read()
         if attachment.content_type.startswith('image/'):
             if attachment.size >= 20 * 1024 * 1024:
                 return "FileTooLarge"
-
             try:
                 with PIL.Image.open(io.BytesIO(file_data)) as img:
                     with io.BytesIO() as output_buffer:
                         img.save(output_buffer, format="PNG")
                         png_data = output_buffer.getvalue()
-
                 return {
                     "mime_type": "image/png",
                     "data": base64.b64encode(png_data).decode("utf-8")
@@ -68,7 +69,6 @@ async def process_attachment(attachment):
             except Exception as e:
                 logger.error(f"Erreur lors du traitement de l'image {attachment.filename}: {e}")
                 return "ImageError"
-
         elif attachment.content_type.startswith('audio/'):
             if attachment.size >= 20 * 1024 * 1024:
                 return "FileTooLarge"
@@ -97,7 +97,6 @@ async def process_attachment(attachment):
         else:
             logger.warning(f"Type de fichier non pris en charge pour {attachment.filename}: {attachment.content_type}")
             return "UnsupportedType"
-
     except Exception as e:
         logger.error(f"Erreur lors de la lecture de la pièce jointe {attachment.filename}: {e}")
         return "ReadError"
@@ -119,19 +118,16 @@ async def on_message(message):
     if re.match(r"^\W", message.content):
         logger.info("on_message: Message ignoré (caractère non-alphanumérique au début, mais pas une commande)")
         return
-
     context = get_channel_context(message.channel.id)
     if context is None:
         logger.info(f"on_message: Bot désactivé dans le channel {message.channel.id}, message ignoré")
         return
-
     message_parts = [{"text": f"{message.author.display_name}: {message.content}"}]
     file_too_large = False
     unsupported_type = False
     decoding_error = False
     image_error = False
     read_error = False
-
     for attachment in message.attachments:
         attachment_data = await process_attachment(attachment)
         if attachment_data == "FileTooLarge":
@@ -148,7 +144,6 @@ async def on_message(message):
             message_parts.append(attachment_data)
         else:
             logger.error(f"on_message: Traitement de pièce jointe non géré: {attachment_data}")
-
     if file_too_large:
         await message.channel.send("Certaines pièces jointes sont trop volumineuses (plus de 20MB) et ont été ignorées.")
     if unsupported_type:
@@ -159,13 +154,10 @@ async def on_message(message):
         await message.channel.send("Erreur lors du traitement de certaines images.")
     if read_error:
         await message.channel.send("Erreur lors de la lecture de certaines pièces jointes.")
-
     if not message_parts:
       return
-
     logger.info(f"on_message: Ajout du message au contexte: {message_parts}")
     context.add_message("user", message_parts)
-
     try:
         logger.info("on_message: Appel de generate_response")
         response = generate_response(context.get_context(), context.model_name, context.system_prompt)
@@ -330,3 +322,85 @@ async def debug_listmodels(ctx):
     except Exception as e:
         error_message = handle_api_error(e)
         await ctx.send(f"Erreur lors de la récupération des modèles : {error_message}")
+
+      
+
+@bot.command(name="join_vc", help="Rejoint le canal vocal de l'utilisateur.")
+async def join_vc(ctx):
+    logger.info(f"'join_vc' command exécutée par {ctx.author} dans le channel {ctx.channel.id}")
+    voice_channel = ctx.author.voice.channel
+    if voice_channel:
+        voice_client = ctx.voice_client
+        if voice_client and voice_client.is_connected():
+            if voice_client.channel == voice_channel:
+                await ctx.send("Je suis déjà connecté à ce canal vocal.")
+                return
+            else:
+                await voice_client.move_to(voice_channel)
+        else:
+            voice_client = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
+
+        recorder = VoiceRecorder(bot, voice_client, ctx.author)
+
+        # Initialiser check_silence_task à None
+        recorder.check_silence_task = None
+
+        # Vérification si le bot est déjà en train d'écouter
+        if voice_client.is_listening():
+            voice_client.stop_listening()
+
+        logger.info(f"Listening to: {recorder.user.display_name} ({recorder.user.id})") # LOG
+        voice_client.listen(voice_recv.BasicSink(recorder.write_audio))
+        voice_client.listening_to = recorder
+
+        # Annuler la tâche check_silence précédente si elle existe
+        if recorder.check_silence_task and not recorder.check_silence_task.done():
+            recorder.check_silence_task.cancel()
+            try:
+                await recorder.check_silence_task
+            except asyncio.CancelledError:
+                logger.info("Tâche check_silence annulée avec succès.")
+
+        async def check_silence():
+            recorder.is_first_silence = True
+            while voice_client.is_listening() and voice_client.listening_to == recorder:
+                await asyncio.sleep(2)
+                if recorder.is_first_silence:
+                    logger.info("check_silence: Premier silence détecté, démarrage de l'enregistrement")
+                    await recorder.start_recording()
+                    recorder.is_first_silence = False
+                elif discord.utils.utcnow().timestamp() - recorder.last_voice_activity > 3:
+                    logger.info("check_silence: Silence detected")
+                    if recorder.recording:
+                        await recorder.on_silence(recorder.user)
+                        await recorder.start_recording()
+                else:
+                    logger.info("check_silence: Voice activity detected within the last 3 seconds")
+            logger.info("check_silence: Exiting loop")
+
+        recorder.check_silence_task = asyncio.create_task(check_silence())
+        await ctx.send(f"Connecté à {voice_channel.name} et enregistrement démarré.")
+    else:
+        await ctx.send("Vous devez être connecté à un canal vocal pour utiliser cette commande.")
+
+
+
+@bot.command(name="leave_vc", help="Quitte le canal vocal.")
+async def leave_vc(ctx):
+    voice_client = ctx.voice_client
+    if voice_client and voice_client.is_connected():
+        recorder = getattr(voice_client, 'listening_to', None)
+        if recorder:
+            await recorder.stop_recording()
+            if hasattr(recorder, 'check_silence_task') and not recorder.check_silence_task.done():
+              recorder.check_silence_task.cancel()
+              try:
+                  await recorder.check_silence_task
+              except asyncio.CancelledError:
+                  logger.info("Tâche check_silence annulée avec succès.")
+        voice_client.stop_listening()
+        voice_client.listening_to = None
+        await voice_client.disconnect()
+        await ctx.send("Déconnecté du canal vocal.")
+    else:
+        await ctx.send("Je ne suis pas connecté à un canal vocal.")
