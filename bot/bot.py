@@ -93,6 +93,9 @@ async def process_attachment(attachment):
 
 @bot.event
 async def on_message(message):
+    if message.author.bot:
+        logger.info("on_message: Message ignoré (auteur = bot)")
+        return
     if message.author == bot.user:
         logger.info("on_message: Message ignoré (auteur = bot)")
         return
