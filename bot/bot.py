@@ -11,7 +11,6 @@ import io
 import PIL.Image
 import base64
 from discord.ext import voice_recv
-import wave
 from utils.audio import VoiceRecorder
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -323,11 +322,11 @@ async def debug_listmodels(ctx):
         error_message = handle_api_error(e)
         await ctx.send(f"Erreur lors de la récupération des modèles : {error_message}")
 
-      
+
 
 @bot.command(name="join_vc", help="Rejoint le canal vocal de l'utilisateur.")
 async def join_vc(ctx):
-    logger.info(f"'join_vc' command exécutée par {ctx.author} dans le channel {ctx.channel.id}")
+    logger.info(f"'join_vc' command executed by {ctx.author} in the channel {ctx.channel.id}")
     voice_channel = ctx.author.voice.channel
     if voice_channel:
         voice_client = ctx.voice_client
@@ -340,45 +339,20 @@ async def join_vc(ctx):
         else:
             voice_client = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
 
-        recorder = VoiceRecorder(bot, voice_client, ctx.author)
+        if not hasattr(voice_client, 'recorder') or voice_client.recorder is None:
+            recorder = VoiceRecorder(voice_client, ctx.author)
+            voice_client.recorder = recorder
+        else:
+            recorder = voice_client.recorder
+            recorder.user = ctx.author
 
-        # Initialiser check_silence_task à None
-        recorder.check_silence_task = None
-
-        # Vérification si le bot est déjà en train d'écouter
         if voice_client.is_listening():
             voice_client.stop_listening()
 
-        logger.info(f"Listening to: {recorder.user.display_name} ({recorder.user.id})") # LOG
+        logger.info(f"Listening to: {recorder.user.display_name} ({recorder.user.id})")
         voice_client.listen(voice_recv.BasicSink(recorder.write_audio))
-        voice_client.listening_to = recorder
+        await recorder.start_recording()
 
-        # Annuler la tâche check_silence précédente si elle existe
-        if recorder.check_silence_task and not recorder.check_silence_task.done():
-            recorder.check_silence_task.cancel()
-            try:
-                await recorder.check_silence_task
-            except asyncio.CancelledError:
-                logger.info("Tâche check_silence annulée avec succès.")
-
-        async def check_silence():
-            recorder.is_first_silence = True
-            while voice_client.is_listening() and voice_client.listening_to == recorder:
-                await asyncio.sleep(2)
-                if recorder.is_first_silence:
-                    logger.info("check_silence: Premier silence détecté, démarrage de l'enregistrement")
-                    await recorder.start_recording()
-                    recorder.is_first_silence = False
-                elif discord.utils.utcnow().timestamp() - recorder.last_voice_activity > 3:
-                    logger.info("check_silence: Silence detected")
-                    if recorder.recording:
-                        await recorder.on_silence(recorder.user)
-                        await recorder.start_recording()
-                else:
-                    logger.info("check_silence: Voice activity detected within the last 3 seconds")
-            logger.info("check_silence: Exiting loop")
-
-        recorder.check_silence_task = asyncio.create_task(check_silence())
         await ctx.send(f"Connecté à {voice_channel.name} et enregistrement démarré.")
     else:
         await ctx.send("Vous devez être connecté à un canal vocal pour utiliser cette commande.")
@@ -389,17 +363,10 @@ async def join_vc(ctx):
 async def leave_vc(ctx):
     voice_client = ctx.voice_client
     if voice_client and voice_client.is_connected():
-        recorder = getattr(voice_client, 'listening_to', None)
-        if recorder:
-            await recorder.stop_recording()
-            if hasattr(recorder, 'check_silence_task') and not recorder.check_silence_task.done():
-              recorder.check_silence_task.cancel()
-              try:
-                  await recorder.check_silence_task
-              except asyncio.CancelledError:
-                  logger.info("Tâche check_silence annulée avec succès.")
+        if hasattr(voice_client, "recorder") and voice_client.recorder:
+          await voice_client.recorder.stop_recording()
+          voice_client.recorder = None
         voice_client.stop_listening()
-        voice_client.listening_to = None
         await voice_client.disconnect()
         await ctx.send("Déconnecté du canal vocal.")
     else:
