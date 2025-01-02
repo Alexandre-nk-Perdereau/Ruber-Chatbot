@@ -7,7 +7,7 @@ source .venv/bin/activate
 cd ~/Ruber
 
 # Lance le bot avec nohup, redirige la sortie vers bot.log et stocke le PID dans bot.pid
-nohup python main.py > bot.log 2>&1 &
+nohup python main.py --log-level DEBUG > bot.log 2>&1 &
 echo $! > bot.pid
 
 echo "Bot démarré. PID:" $(cat bot.pid)
