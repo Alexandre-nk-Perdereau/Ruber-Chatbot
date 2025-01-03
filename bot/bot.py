@@ -11,7 +11,6 @@ import io
 import PIL.Image
 import base64
 from discord.ext import voice_recv
-from utils.audio import VoiceRecorder
 from utils.context import ContextManager
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -323,53 +322,3 @@ async def debug_listmodels(ctx):
     except Exception as e:
         error_message = handle_api_error(e)
         await ctx.send(f"Erreur lors de la récupération des modèles : {error_message}")
-
-
-
-@bot.command(name="join_vc", help="Rejoint le canal vocal de l'utilisateur.")
-async def join_vc(ctx):
-    logger.info(f"'join_vc' command executed by {ctx.author} in the channel {ctx.channel.id}")
-    voice_channel = ctx.author.voice.channel
-    if voice_channel:
-        voice_client = ctx.voice_client
-        if voice_client and voice_client.is_connected():
-            if voice_client.channel == voice_channel:
-                await ctx.send("Je suis déjà connecté à ce canal vocal.")
-                return
-            else:
-                await voice_client.move_to(voice_channel)
-        else:
-            voice_client = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
-
-        if not hasattr(voice_client, 'recorder') or voice_client.recorder is None:
-            recorder = VoiceRecorder(voice_client, ctx.author)
-            voice_client.recorder = recorder
-        else:
-            recorder = voice_client.recorder
-            recorder.user = ctx.author
-
-        if voice_client.is_listening():
-            voice_client.stop_listening()
-
-        logger.info(f"Listening to: {recorder.user.display_name} ({recorder.user.id})")
-        voice_client.listen(voice_recv.BasicSink(recorder.write_audio))
-        await recorder.start_recording()
-
-        await ctx.send(f"Connecté à {voice_channel.name} et enregistrement démarré.")
-    else:
-        await ctx.send("Vous devez être connecté à un canal vocal pour utiliser cette commande.")
-
-
-
-@bot.command(name="leave_vc", help="Quitte le canal vocal.")
-async def leave_vc(ctx):
-    voice_client = ctx.voice_client
-    if voice_client and voice_client.is_connected():
-        if hasattr(voice_client, "recorder") and voice_client.recorder:
-          await voice_client.recorder.stop_recording()
-          voice_client.recorder = None
-        voice_client.stop_listening()
-        await voice_client.disconnect()
-        await ctx.send("Déconnecté du canal vocal.")
-    else:
-        await ctx.send("Je ne suis pas connecté à un canal vocal.")
