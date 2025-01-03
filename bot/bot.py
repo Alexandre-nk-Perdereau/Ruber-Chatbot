@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 from utils.gemini import generate_images, generate_response, handle_api_error, list_models, setup_gemini_api
-from utils.context import ChannelContext
+from utils.attachments import MessageAttachment
 import os
 import re
 import json
@@ -12,6 +12,7 @@ import PIL.Image
 import base64
 from discord.ext import voice_recv
 from utils.audio import VoiceRecorder
+from utils.context import ContextManager
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -42,7 +43,7 @@ def get_channel_context(channel_id):
         return None
     if channel_id not in channel_contexts:
         logger.info(f"get_channel_context: Création d'un contexte pour le channel {channel_id}")
-        channel_contexts[channel_id] = ChannelContext(channel_id)
+        channel_contexts[channel_id] = ContextManager(channel_id)  # Changé de ChannelContext à ContextManager
     return channel_contexts[channel_id]
 
 @bot.event
@@ -105,86 +106,84 @@ async def on_message(message):
     if message.author.bot:
         logger.info("on_message: Message ignoré (auteur = bot)")
         return
-    if message.author == bot.user:
-        logger.info("on_message: Message ignoré (auteur = bot)")
-        return
-    if message.content.lower().startswith("(ignore)"):
-        logger.info("on_message: Message ignoré (commence par '(ignore)')")
-        return
+
     if message.content.startswith(bot.command_prefix):
         await bot.process_commands(message)
         return
+
+    if message.content.lower().startswith("(ignore)"):
+        logger.info("on_message: Message ignoré (commence par '(ignore)')")
+        return
+
     if re.match(r"^\W", message.content):
         logger.info("on_message: Message ignoré (caractère non-alphanumérique au début, mais pas une commande)")
         return
+
     context = get_channel_context(message.channel.id)
     if context is None:
         logger.info(f"on_message: Bot désactivé dans le channel {message.channel.id}, message ignoré")
         return
+
+    attachment_handler = MessageAttachment()
+    
     message_parts = [{"text": f"{message.author.display_name}: {message.content}"}]
-    file_too_large = False
-    unsupported_type = False
-    decoding_error = False
-    image_error = False
-    read_error = False
+    
+    errors = []
     for attachment in message.attachments:
-        attachment_data = await process_attachment(attachment)
-        if attachment_data == "FileTooLarge":
-            file_too_large = True
-        elif attachment_data == "UnsupportedType":
-            unsupported_type = True
-        elif attachment_data == "DecodingError":
-            decoding_error = True
-        elif attachment_data == "ImageError":
-            image_error = True
-        elif attachment_data == "ReadError":
-            read_error = True
-        elif isinstance(attachment_data, dict):
-            message_parts.append(attachment_data)
-        else:
-            logger.error(f"on_message: Traitement de pièce jointe non géré: {attachment_data}")
-    if file_too_large:
-        await message.channel.send("Certaines pièces jointes sont trop volumineuses (plus de 20MB) et ont été ignorées.")
-    if unsupported_type:
-        await message.channel.send("Certains types de fichiers ne sont pas pris en charge et ont été ignorés.")
-    if decoding_error:
-        await message.channel.send("Erreur de décodage de certains fichiers texte. Assurez-vous qu'ils sont encodés en UTF-8.")
-    if image_error:
-        await message.channel.send("Erreur lors du traitement de certaines images.")
-    if read_error:
-        await message.channel.send("Erreur lors de la lecture de certaines pièces jointes.")
+        processed_data, error = await attachment_handler.process_attachment(attachment)
+        if error:
+            errors.append(error)
+        elif processed_data:
+            message_parts.append(processed_data)
+
+    # Notifier l'utilisateur des erreurs de pièces jointes s'il y en a
+    if errors:
+        error_message = "\n".join(errors)
+        await message.channel.send(f"Erreurs lors du traitement des pièces jointes:\n{error_message}")
+
+    # Si pas de contenu texte et toutes les pièces jointes en erreur, on ne poursuit pas
     if not message_parts:
-      return
+        logger.info("on_message: Pas de contenu à traiter (pas de texte et pièces jointes en erreur)")
+        return
+
+    # Ajouter le message au contexte
     logger.info(f"on_message: Ajout du message au contexte: {message_parts}")
     context.add_message("user", message_parts)
+
     try:
+        # Générer la réponse
         logger.info("on_message: Appel de generate_response")
         response = generate_response(context.get_context(), context.model_name, context.system_prompt)
         response_text = ""
         sent_message = None
+
         logger.info("on_message: Début de la boucle de réception des chunks")
         for chunk in response:
             logger.info(f"on_message: Chunk reçu: {chunk.text}")
+            
             if sent_message and len(response_text) + len(chunk.text) > DISCORD_MESSAGE_LENGTH_LIMIT - 3:
                 logger.info("on_message: Envoi du message actuel car le prochain chunk ferait dépasser la limite")
                 await sent_message.edit(content=response_text)
                 sent_message = await message.channel.send("...")
                 response_text = ""
+            
             response_text += chunk.text
+            
             if sent_message:
-                logger.info(f"on_message: Modification du message existant: {sent_message.content}")
                 if len(response_text) <= DISCORD_MESSAGE_LENGTH_LIMIT - 3:
                     await sent_message.edit(content=response_text + "...")
                 else:
-                    logger.info("on_message: Envoi d'un nouveau message car le chunk seul est trop long")
                     await sent_message.edit(content=response_text)
-                    response_text = ""
                     sent_message = None
+                    response_text = ""
             else:
-                logger.info("on_message: Envoi d'un nouveau message")
                 sent_message = await message.channel.send(response_text + "...")
+
             await asyncio.sleep(0.5)
+
         logger.info("on_message: Fin de la boucle de réception des chunks")
+        
+        # Gérer le dernier message
         if sent_message:
             if response_text:
                 await sent_message.edit(content=response_text)
@@ -192,8 +191,11 @@ async def on_message(message):
                 await sent_message.delete()
         elif response_text:
             await message.channel.send(response_text)
+
+        # Ajouter la réponse au contexte
         logger.info(f"on_message: Ajout de la réponse au contexte: {response_text}")
         context.add_message("model", response_text)
+
     except Exception as e:
         logger.error(f"on_message: Une erreur est survenue: {e}")
         error_message = handle_api_error(e)

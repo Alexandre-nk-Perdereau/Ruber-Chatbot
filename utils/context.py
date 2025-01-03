@@ -1,38 +1,71 @@
-import base64
 import os
 import json
-from utils.gemini import count_tokens
+import logging
+import base64
 from utils.config import get_default_context_size, get_default_system_prompt, get_default_model
+from utils.gemini import count_tokens
 
-class ChannelContext:
-    def __init__(self, channel_id, system_prompt=None, context_size=None, model_name=None):
+logger = logging.getLogger(__name__)
+
+class ContextManager:
+    """Manages conversation context and message history with token caching"""
+    
+    def __init__(self, channel_id, system_prompt=None):
         self.channel_id = channel_id
+        self.contexts_dir = "contexts"
+        self.context_file = os.path.join(self.contexts_dir, f"{channel_id}.json")
+        self._ensure_contexts_directory()
+        
         self.system_prompt = system_prompt or get_default_system_prompt()
-        self.context_size = context_size or get_default_context_size()
-        self.model_name = model_name or get_default_model()
-        self.context_file = os.path.join("contexts", f"{channel_id}.json")
-        self.messages = self.load_context()
+        self.model_name = get_default_model()
+        self.context_size = get_default_context_size()
+        
+        # Structure: {"messages": [...], "token_counts": [...], "total_tokens": int}
+        self.context_data = self._load_context()
+        
+    def _ensure_contexts_directory(self):
+        """Ensure the contexts directory exists"""
+        os.makedirs(self.contexts_dir, exist_ok=True)
 
-    def _ensure_contexts_directory_exists(self):
-        contexts_dir = os.path.dirname(self.context_file)
-        os.makedirs(contexts_dir, exist_ok=True)
-
-    def load_context(self):
-        self._ensure_contexts_directory_exists()
+    def _load_context(self):
+        """Load context from file or create new if doesn't exist"""
         try:
             with open(self.context_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                data[0] = {"role": "system", "parts": [self.system_prompt]}
+                if isinstance(data, list):
+                    messages = data
+                    token_counts = [count_tokens(msg["parts"][0], self.model_name) for msg in messages]
+                    data = {
+                        "messages": messages,
+                        "token_counts": token_counts,
+                        "total_tokens": sum(token_counts)
+                    }
+                
+                # S'assurer que le premier message est le system prompt
+                data["messages"][0] = {"role": "system", "parts": [self.system_prompt]}
+                data["token_counts"][0] = count_tokens(self.system_prompt, self.model_name)
+                data["total_tokens"] = sum(data["token_counts"])
+                
                 return data
-        except FileNotFoundError:
-            return [{"role": "system", "parts": [self.system_prompt]}]
+        except (FileNotFoundError, json.JSONDecodeError):
+            # Créer un nouveau contexte
+            system_tokens = count_tokens(self.system_prompt, self.model_name)
+            return {
+                "messages": [{"role": "system", "parts": [self.system_prompt]}],
+                "token_counts": [system_tokens],
+                "total_tokens": system_tokens
+            }
 
     def save_context(self):
+        """Save current context to file"""
         with open(self.context_file, "w", encoding="utf-8") as f:
-            json.dump(self.messages, f, ensure_ascii=False, indent=4)
+            json.dump(self.context_data, f, ensure_ascii=False, indent=2)
 
     def add_message(self, role, content):
-        if isinstance(content, list):
+        """Add a message to the context with token counting"""
+        if isinstance(content, str):
+            content = [content]
+        elif isinstance(content, list):
             encoded_content = []
             for item in content:
                 if isinstance(item, dict) and "data" in item:
@@ -49,87 +82,73 @@ class ChannelContext:
                 else:
                     encoded_content.append(item)
             content = encoded_content
-        elif isinstance(content, str):
-            content = [content]
-        else:
-            content = [content]
-        message = {"role": role, "parts": content}
-        self.messages.append(message)
-        self.trim_context()
-        self.save_context()
-    
-    def get_context(self):
-        decoded_messages = []
-        for msg in self.messages:
-            if msg["role"] in ("user", "model"):
-                decoded_parts = []
-                for part in msg["parts"]:
-                    if isinstance(part, dict) and "data" in part:
-                        if part["mime_type"] == "text/plain":
-                            decoded_parts.append(part)
-                        elif isinstance(part["data"], str):
-                            try:
-                                if part["mime_type"] in ["image/png", "image/jpeg", "image/heic", "image/heif", "image/webp", "audio/wav", "audio/mp3", "audio/aiff", "audio/aac", "audio/ogg", "audio/flac"]:
-                                    decoded_data = base64.b64decode(part["data"])
-                                    decoded_parts.append({"mime_type": part["mime_type"], "data": decoded_data})
-                                else:
-                                    decoded_parts.append(part)
-                            except Exception as e:
-                                print(f"Erreur lors du décodage base64 : {e}")
-                                decoded_parts.append(part)
-                        else:
-                            decoded_parts.append(part)
-                    elif isinstance(part, str):
-                        decoded_parts.append(part)
-                    else:
-                        decoded_parts.append(part)
-                decoded_messages.append({"role": msg["role"], "parts": decoded_parts})
-            else:
-                decoded_messages.append(msg)
-        return decoded_messages
 
-    def trim_context(self):
-        token_count = sum(count_tokens(msg["parts"][0], self.model_name) for msg in self.messages)
-        while token_count > self.context_size:
-            if len(self.messages) > 1:
-                removed_message = self.messages.pop(1)
-                token_count -= count_tokens(removed_message["parts"][0], self.model_name)
-            else:
-                print("Error: The context is still too big! (Something went wrong)")
-                break
+        message = {"role": role, "parts": content}
+        message_tokens = count_tokens(content[0], self.model_name)
+
+        self.context_data["messages"].append(message)
+        self.context_data["token_counts"].append(message_tokens)
+        self.context_data["total_tokens"] += message_tokens
+
+        self._trim_context()
+        self.save_context()
+
+    def _trim_context(self):
+        """Trim context when it exceeds the token limit using cached token counts"""
+        while (self.context_data["total_tokens"] > self.context_size and 
+               len(self.context_data["messages"]) > 1):
+            self.context_data["total_tokens"] -= self.context_data["token_counts"][1]
+            self.context_data["messages"].pop(1)
+            self.context_data["token_counts"].pop(1)
 
     def clear_context(self):
-        self.messages = [{"role": "system", "parts": [self.system_prompt]}]
+        """Clear context except system prompt"""
+        system_tokens = self.context_data["token_counts"][0]
+        self.context_data = {
+            "messages": [self.context_data["messages"][0]],
+            "token_counts": [system_tokens],
+            "total_tokens": system_tokens
+        }
         self.save_context()
 
-    def download_context(self):
-        context_str = ""
-        for message in self.messages:
-            role = message["role"].capitalize()
-            content = message['parts'][0]
-            if isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict) and 'data' in item:
-                        context_str += f"{role}: Fichier - {item.get('filename', 'unknown')} (Type: {item.get('mime_type', 'unknown')})\n"
-                    else:
-                        context_str += f"{role}: {item}\n"
-            else:
-                context_str += f"{role}: {content}\n"
-            context_str += "\n"
-        return context_str
+    def get_context(self):
+        """Get current context"""
+        return self.context_data["messages"]
 
-    def set_system_prompt(self, new_system_prompt):
-        self.system_prompt = new_system_prompt
-        self.messages[0] = {"role": "system", "parts": [self.system_prompt]}
-        self.trim_context()
-        self.save_context()
+    def get_token_count(self):
+        """Get current total token count"""
+        return self.context_data["total_tokens"]
 
-    def set_context_size(self, new_context_size):
-        self.context_size = new_context_size
-        self.trim_context()
+    def set_system_prompt(self, new_prompt):
+        """Update system prompt with token recounting"""
+        self.system_prompt = new_prompt
+        new_tokens = count_tokens(new_prompt, self.model_name)
+        
+        self.context_data["total_tokens"] -= self.context_data["token_counts"][0]
+        self.context_data["total_tokens"] += new_tokens
+        
+        self.context_data["messages"][0] = {"role": "system", "parts": [self.system_prompt]}
+        self.context_data["token_counts"][0] = new_tokens
+        
+        self._trim_context()
         self.save_context()
 
     def set_model(self, new_model):
+        """Update model name with token recounting"""
+        old_model = self.model_name
         self.model_name = new_model
-        self.trim_context()
+        
+        new_token_counts = [count_tokens(msg["parts"][0], new_model) 
+                          for msg in self.context_data["messages"]]
+        
+        self.context_data["token_counts"] = new_token_counts
+        self.context_data["total_tokens"] = sum(new_token_counts)
+        
+        self._trim_context()
+        self.save_context()
+
+    def set_context_size(self, new_size):
+        """Update context size"""
+        self.context_size = new_size
+        self._trim_context()
         self.save_context()
