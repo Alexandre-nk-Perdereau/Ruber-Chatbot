@@ -80,15 +80,16 @@ This chatbot is structured into several modules:
 
 ### Commands
 
-*   `/activer`: Activates the chatbot in the current channel.
-*   `/desactiver`: Deactivates the chatbot in the current channel.
-*   `/clear`: Clears the conversation context for the current channel.
-*   `/download`: Downloads the conversation context for the current channel as a text file.
-*   `/set_system_prompt <new_system_prompt>`: Sets a new system prompt for the current channel.
-*   `/set_context_size <new_context_size>`: Sets the maximum context size (in tokens) for the current channel.
-*   `/set_model <new_model>`: Sets the Gemini model to be used for the current channel.
-*   `/info`: Displays the current settings (system prompt, model, context size) for the current channel.
-*   `/debug_listmodels`: Lists the available Gemini models and their supported methods.
+*   `?activer`: Activates the chatbot in the current channel.
+*   `?desactiver`: Deactivates the chatbot in the current channel.
+*   `?clear`: Clears the conversation context for the current channel.
+*   `?download`: Downloads the conversation context for the current channel as a text file.
+*   `?set_system_prompt <new_system_prompt>`: Sets a new system prompt for the current channel.
+*   `?set_context_size <new_context_size>`: Sets the maximum context size (in tokens) for the current channel.
+*   `?set_model <new_model>`: Sets the Gemini model to be used for the current channel.
+*   `?info`: Displays the current settings (system prompt, model, context size) for the current channel.
+*   `?debug_listmodels`: Lists the available Gemini models and their supported methods.
+*   `?tts`: Summon Ruber in the user voice chat, then apply text to speech to each output of the chanel where this command has been invoked using elevenlabs API.
 
 The imagen command doesn't work yet, waiting the integration of imagen3 in gemini API.
 

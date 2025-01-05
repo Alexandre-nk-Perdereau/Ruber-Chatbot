@@ -10,8 +10,9 @@ import asyncio
 import io
 import PIL.Image
 import base64
-from discord.ext import voice_recv
+from utils.config import get_elevenlabs_api_key, get_elevenlabs_voice_id, get_elevenlabs_model_id
 from utils.context import ContextManager
+from elevenlabs.client import ElevenLabs
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -22,6 +23,8 @@ bot = commands.Bot(command_prefix="?", intents=intents)
 channel_contexts = {}
 ACTIVATED_CHANNELS_FILE = "activated_channels.json"
 DISCORD_MESSAGE_LENGTH_LIMIT = 2000
+tts_enabled_channels = set()
+voice_clients = {}
 
 def load_activated_channels():
     try:
@@ -186,10 +189,14 @@ async def on_message(message):
         if sent_message:
             if response_text:
                 await sent_message.edit(content=response_text)
+                if message.channel.id in tts_enabled_channels and message.guild.id in voice_clients:
+                    await play_tts(voice_clients[message.guild.id], response_text)
             else:
                 await sent_message.delete()
         elif response_text:
             await message.channel.send(response_text)
+            if message.channel.id in tts_enabled_channels and message.guild.id in voice_clients:
+                await play_tts(voice_clients[message.guild.id], response_text)
 
         # Ajouter la réponse au contexte
         logger.info(f"on_message: Ajout de la réponse au contexte: {response_text}")
@@ -213,6 +220,9 @@ async def desactiver(ctx):
     logger.info(f"'desactiver' command exécutée par {ctx.author} dans le channel {ctx.channel.id}")
     if ctx.channel.id in activated_channels:
         activated_channels.remove(ctx.channel.id)
+        if ctx.channel.id in tts_enabled_channels:
+            tts_enabled_channels.remove(ctx.channel.id)
+            await leave_voice_channel(ctx.guild.id)
         if ctx.channel.id in channel_contexts:
             del channel_contexts[ctx.channel.id]
         save_activated_channels()
@@ -322,3 +332,86 @@ async def debug_listmodels(ctx):
     except Exception as e:
         error_message = handle_api_error(e)
         await ctx.send(f"Erreur lors de la récupération des modèles : {error_message}")
+
+
+async def join_voice_channel(voice_channel):
+    """Rejoint un canal vocal."""
+    try:
+        voice_client = await voice_channel.connect()
+        return voice_client
+    except Exception as e:
+        logger.error(f"Erreur lors de la connexion au canal vocal: {e}")
+        return None
+
+async def leave_voice_channel(guild_id):
+    """Quitte un canal vocal."""
+    if guild_id in voice_clients:
+        try:
+            await voice_clients[guild_id].disconnect()
+            del voice_clients[guild_id]
+        except Exception as e:
+            logger.error(f"Erreur lors de la déconnexion du canal vocal: {e}")
+
+async def play_tts(voice_client, text):
+    """Joue le texte en TTS dans le canal vocal."""
+    try:
+        temp_file = io.BytesIO()
+        
+        elevenlabs_client = ElevenLabs(api_key=get_elevenlabs_api_key())
+        audio_stream = elevenlabs_client.text_to_speech.convert_as_stream(
+            text=text,
+            voice_id=get_elevenlabs_voice_id(),
+            model_id=get_elevenlabs_model_id(),
+            output_format="mp3_44100_128"
+        )
+        
+        for chunk in audio_stream:
+            if isinstance(chunk, bytes):
+                temp_file.write(chunk)
+        
+        temp_file.seek(0)
+        
+        audio_source = discord.FFmpegPCMAudio(
+            temp_file,
+            pipe=True,
+            before_options='-f mp3',
+            options='-acodec pcm_s16le -ar 44100 -ac 2'
+        )
+        
+        if voice_client.is_playing():
+            voice_client.stop()
+        
+        voice_client.play(audio_source, after=lambda e: temp_file.close() if e is None else print(f'Error: {e}'))
+        
+        while voice_client.is_playing():
+            await asyncio.sleep(0.1)
+            
+    except Exception as e:
+        logger.error(f"Erreur lors de la lecture TTS: {e}")
+
+
+@bot.command(name="tts", help="Active/désactive la lecture vocale des réponses du bot.")
+async def tts(ctx):
+    """Active ou désactive le TTS pour ce canal."""
+    if ctx.channel.id not in activated_channels:
+        await ctx.send("Le bot n'est pas activé dans ce canal. Utilisez d'abord ?activer")
+        return
+
+    if not ctx.author.voice:
+        await ctx.send("Vous devez être dans un canal vocal pour utiliser cette commande.")
+        return
+
+    if ctx.channel.id in tts_enabled_channels:
+        # Désactivation du TTS
+        tts_enabled_channels.remove(ctx.channel.id)
+        await leave_voice_channel(ctx.guild.id)
+        await ctx.send("Lecture vocale désactivée pour ce canal.")
+    else:
+        # Activation du TTS
+        voice_client = await join_voice_channel(ctx.author.voice.channel)
+        if voice_client:
+            voice_clients[ctx.guild.id] = voice_client
+            tts_enabled_channels.add(ctx.channel.id)
+            await ctx.send("Lecture vocale activée pour ce canal.")
+        else:
+            await ctx.send("Impossible de rejoindre le canal vocal.")

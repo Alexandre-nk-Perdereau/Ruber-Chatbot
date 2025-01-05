@@ -22,3 +22,12 @@ def get_default_system_prompt():
       "Les messages des utilisateurs te sont transmis avec le nom d'utilisateur affiché en premier, suivi de deux points, puis du contenu du message. Par exemple: 'Utilisateur A: Bonjour !'. "
       "Tu n'es pas censé imiter ce format, répond de la manière la plus naturelle possible."
   )
+
+def get_elevenlabs_api_key():
+    return os.getenv("ELEVENLABS_API_KEY")
+
+def get_elevenlabs_voice_id():
+    return os.getenv("ELEVENLABS_VOICE_ID")
+
+def get_elevenlabs_model_id():
+    return os.getenv("ELEVENLABS_MODEL_ID")
