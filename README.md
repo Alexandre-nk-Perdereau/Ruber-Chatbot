@@ -61,6 +61,12 @@ This chatbot is structured into several modules:
         DEFAULT_SYSTEM_PROMPT="You are Ruber, a helpful and friendly chatbot."
         ```
         **Note:** Adjust the `DEFAULT_MODEL`, `DEFAULT_CONTEXT_SIZE`, and `DEFAULT_SYSTEM_PROMPT` to your desired values.
+    *   If you want to use tts, add:
+    ```
+    ELEVENLABS_API_KEY=your_eleven_labs_api_key
+    ELEVENLABS_VOICE_ID=a_elevenlabs_voice_id
+    ELEVENLABS_MODEL_ID=a_elevenlabs_model_id
+    ```
 
 ## Running the Chatbot
 
