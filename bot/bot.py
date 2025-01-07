@@ -8,8 +8,6 @@ import json
 import logging
 import asyncio
 import io
-import PIL.Image
-import base64
 from utils.config import get_elevenlabs_api_key, get_elevenlabs_voice_id, get_elevenlabs_model_id
 from utils.context import ContextManager
 from elevenlabs.client import ElevenLabs
@@ -45,64 +43,13 @@ def get_channel_context(channel_id):
         return None
     if channel_id not in channel_contexts:
         logger.info(f"get_channel_context: Création d'un contexte pour le channel {channel_id}")
-        channel_contexts[channel_id] = ContextManager(channel_id)  # Changé de ChannelContext à ContextManager
+        channel_contexts[channel_id] = ContextManager(channel_id)
     return channel_contexts[channel_id]
 
 @bot.event
 async def on_ready():
     logger.info(f"{bot.user} est prêt et connecté à Discord!")
     setup_gemini_api()
-
-async def process_attachment(attachment):
-    try:
-        file_data = await attachment.read()
-        if attachment.content_type.startswith('image/'):
-            if attachment.size >= 20 * 1024 * 1024:
-                return "FileTooLarge"
-            try:
-                with PIL.Image.open(io.BytesIO(file_data)) as img:
-                    with io.BytesIO() as output_buffer:
-                        img.save(output_buffer, format="PNG")
-                        png_data = output_buffer.getvalue()
-                return {
-                    "mime_type": "image/png",
-                    "data": base64.b64encode(png_data).decode("utf-8")
-                }
-            except Exception as e:
-                logger.error(f"Erreur lors du traitement de l'image {attachment.filename}: {e}")
-                return "ImageError"
-        elif attachment.content_type.startswith('audio/'):
-            if attachment.size >= 20 * 1024 * 1024:
-                return "FileTooLarge"
-            return {
-                "mime_type": attachment.content_type,
-                "data": base64.b64encode(file_data).decode("utf-8")
-            }
-        elif attachment.content_type == 'text/plain' or (attachment.content_type and attachment.content_type.startswith("application/")):
-          if attachment.size >= 20 * 1024 * 1024:
-              return "FileTooLarge"
-          try:
-              decoded_text = file_data.decode("utf-8")
-              return {"mime_type": "text/plain", "data": decoded_text}
-          except UnicodeDecodeError:
-              logger.error(
-                  f"Erreur de décodage du fichier {attachment.filename}. Assurez-vous qu'il est encodé en UTF-8."
-              )
-              return "DecodingError"
-        elif attachment.content_type == 'video/mp4':
-            if attachment.size >= 20 * 1024 * 1024:
-                return "FileTooLarge"
-            return {
-                "mime_type": "video/mp4",
-                "data": base64.b64encode(file_data).decode("utf-8")
-            }
-        else:
-            logger.warning(f"Type de fichier non pris en charge pour {attachment.filename}: {attachment.content_type}")
-            return "UnsupportedType"
-    except Exception as e:
-        logger.error(f"Erreur lors de la lecture de la pièce jointe {attachment.filename}: {e}")
-        return "ReadError"
-
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -136,7 +83,10 @@ async def on_message(message):
         if error:
             errors.append(error)
         elif processed_data:
-            message_parts.append(processed_data)
+            if processed_data.get("mime_type") == "text/plain":
+                message_parts[0]["text"] += "\n" + processed_data["data"]
+            else:
+                message_parts.append(processed_data)
 
     # Notifier l'utilisateur des erreurs de pièces jointes s'il y en a
     if errors:

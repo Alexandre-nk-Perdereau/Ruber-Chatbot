@@ -11,9 +11,9 @@ class MessageAttachment:
     def __init__(self):
         self.SUPPORTED_MIME_TYPES = {
             'image': ['image/png', 'image/jpeg', 'image/heic', 'image/heif', 'image/webp'],
-            'audio': ['audio/wav', 'audio/mp3', 'audio/aiff', 'audio/aac', 'audio/ogg', 'audio/flac'],
-            'text': ['text/plain', 'application/json', 'text/markdown'],
-            'video': ['video/mp4', 'video/mpeg', 'video/quicktime']
+            'audio': ['audio/wav', 'audio/mpeg', 'audio/aiff', 'audio/aac', 'audio/ogg', 'audio/flac'],
+            'text': ['text/plain', 'application/json', 'text/markdown', 'application/pdf', 'application/x-javascript', 'text/javascript', 'application/x-python', 'text/x-python', 'text/html', 'text/css', 'text/csv', 'text/xml', 'text/rtf'],
+            'video': ['video/mp4', 'video/mpeg', 'video/mov', 'video/avi', 'video/x-flv', 'video/mpg', 'video/webm', 'video/wmv', 'video/3gpp']
         }
         self.MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 
@@ -34,23 +34,21 @@ class MessageAttachment:
             base_content_type = content_type.split(';')[0].strip()
             
             supported = False
-            for category in self.SUPPORTED_MIME_TYPES:
-                if base_content_type in self.SUPPORTED_MIME_TYPES[category]:
+            expected_types = []
+            for category, types in self.SUPPORTED_MIME_TYPES.items():
+                expected_types.extend(types)
+                if base_content_type in types:
                     supported = True
-                    break
-            
+                    if category == 'image':
+                        return await self._process_image(file_data, content_type)
+                    elif category == 'audio':
+                        return await self._process_audio(file_data, content_type)
+                    elif category == 'text':
+                        return await self._process_text(file_data, base_content_type)
+                    elif category == 'video':
+                        return await self._process_video(file_data, content_type)
             if not supported:
-                return None, f"Unsupported file type: {content_type}"
-
-            if content_type.startswith('image/'):
-                return await self._process_image(file_data, content_type)
-            elif content_type.startswith('audio/'):
-                return await self._process_audio(file_data, content_type)
-            elif content_type.startswith(('text/', 'application/')):
-                return await self._process_text(file_data)
-            elif content_type.startswith('video/'):
-                return await self._process_video(file_data, content_type)
-            
+                return None, f"Unsupported file type: {content_type}. Supported types are: {', '.join(expected_types)}"
             return None, "Unhandled content type"
 
         except Exception as e:
@@ -78,20 +76,23 @@ class MessageAttachment:
             "mime_type": content_type,
             "data": base64.b64encode(file_data).decode('utf-8')
         }, None
-
-    async def _process_text(self, file_data):
+    async def _process_text(self, file_data, content_type):
         """Process text attachments"""
-        try:
+        if content_type == 'application/pdf':
+            return {
+                "mime_type": content_type,
+                "data": base64.b64encode(file_data).decode('utf-8')
+            }, None
+        else:
             try:
-                text_content = file_data.decode('utf-8')
-            except UnicodeDecodeError:
-                text_content = file_data.decode('utf-8-sig')
-            
-            return {"text": text_content}, None
-
-        except Exception as e:
-            logger.error(f"Error processing text file: {str(e)}")
-            return None, "Error: File must be UTF-8 encoded"
+                try:
+                    text_content = file_data.decode('utf-8')
+                except UnicodeDecodeError:
+                    text_content = file_data.decode('utf-8-sig')
+                return {"text": text_content}, None
+            except Exception as e:
+                logger.error(f"Error processing text file: {str(e)}")
+                return None, "Error: File must be UTF-8 encoded"
 
     async def _process_video(self, file_data, content_type):
         """Process video attachments"""
