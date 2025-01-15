@@ -1,7 +1,9 @@
 import argparse
 import logging
-from bot.bot import bot
+import discord
+from discord.ext import commands
 from utils.config import get_discord_bot_token
+from bot.bot import setup_bot
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -12,5 +14,12 @@ if __name__ == "__main__":
     if not isinstance(numeric_level, int):
         raise ValueError(f'Invalid log level: {args.log_level}')
     logging.basicConfig(level=numeric_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.voice_states = True
+    bot = commands.Bot(command_prefix="?", intents=intents)
+    
+    setup_bot(bot)
 
     bot.run(get_discord_bot_token())
