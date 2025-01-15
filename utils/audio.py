@@ -2,6 +2,9 @@ import discord
 import asyncio
 import io
 import logging
+import wave
+import time
+import struct
 from elevenlabs.client import ElevenLabs
 from utils.config import get_elevenlabs_api_key, get_elevenlabs_voice_id, get_elevenlabs_model_id
 
@@ -53,3 +56,60 @@ async def play_tts(voice_client, text):
             await asyncio.sleep(0.1)
     except Exception as e:
         logger.error(f"Erreur lors de la lecture TTS: {e}")
+
+class GlobalSilenceWatcher(discord.sinks.WaveSink):
+    def __init__(self, callback, timeout=4.0, min_duration=0.2, volume_threshold=0.05):
+        super().__init__()
+        self.callback = callback
+        self.timeout = timeout
+        self.min_duration = min_duration
+        self.volume_threshold = volume_threshold
+        self.last_audio = 0
+        self.buffer = io.BytesIO()
+        self.wave_writer = None
+        self.start_time = None
+
+    def write(self, data, user):
+        if data:
+            sound_data = struct.unpack("%sh" % (len(data) // 2), data)
+            volume = max(sound_data) / 32768.0
+
+            if volume > self.volume_threshold:
+                if self.wave_writer is None:
+                    self.buffer = io.BytesIO()
+                    self.wave_writer = wave.open(self.buffer, 'wb')
+                    self.wave_writer.setnchannels(2)
+                    self.wave_writer.setsampwidth(2)
+                    self.wave_writer.setframerate(48000)
+                    self.start_time = time.time()
+                self.last_audio = time.time()
+                self.wave_writer.writeframes(data)
+
+    async def check_silence(self):
+        while True:
+            if self.wave_writer and self.last_audio > 0 and (time.time() - self.last_audio) > self.timeout and (time.time() - self.start_time) >= self.min_duration:
+                self.last_audio = 0
+                self.wave_writer.close()
+                self.wave_writer = None
+
+                send_buffer = io.BytesIO(self.buffer.getvalue())
+
+                self.buffer.seek(0)
+                self.buffer.truncate()
+
+                await self.callback(send_buffer)
+            await asyncio.sleep(0.1)
+
+    def cleanup(self):
+        if self.wave_writer:
+            self.wave_writer.close()
+        self.buffer.close()
+            
+async def start_recording(voice_client, sink, channel_id):
+    try:
+        voice_client.start_recording(sink, on_audio_complete, channel_id)
+    except Exception as e:
+        logger.error(f"Erreur lors du démarrage de l'enregistrement: {e}")
+
+async def on_audio_complete(sink, channel_id):
+    pass

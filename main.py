@@ -19,7 +19,7 @@ if __name__ == "__main__":
     intents.message_content = True
     intents.voice_states = True
     bot = commands.Bot(command_prefix="?", intents=intents)
-    
+
     setup_bot(bot)
 
     bot.run(get_discord_bot_token())

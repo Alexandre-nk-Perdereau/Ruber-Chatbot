@@ -1,3 +1,4 @@
+import base64
 import discord
 from discord.ext import commands
 from utils.gemini import generate_images, generate_response, handle_api_error, list_models, setup_gemini_api
@@ -9,19 +10,18 @@ import logging
 import asyncio
 import io
 from utils.context import ContextManager
-from utils.audio import join_voice_channel, leave_voice_channel, play_tts
+from utils.audio import join_voice_channel, leave_voice_channel, play_tts, GlobalSilenceWatcher, start_recording
+import pydub
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-intents = discord.Intents.default()
-intents.message_content = True
-intents.voice_states = True
 
 channel_contexts = {}
 ACTIVATED_CHANNELS_FILE = "activated_channels.json"
 DISCORD_MESSAGE_LENGTH_LIMIT = 2000
 tts_enabled_channels = set()
 voice_clients = {}
+voice_chat_channels = {}
 
 def load_activated_channels():
     try:
@@ -45,17 +45,75 @@ def get_channel_context(channel_id):
         channel_contexts[channel_id] = ContextManager(channel_id)
     return channel_contexts[channel_id]
 
+async def on_audio_data_ready(buffer, ctx):
+    context = get_channel_context(ctx.channel.id)
+    buffer.seek(0)
+    audio_bytes = buffer.read()
+
+    audio = io.BytesIO()
+    sound = pydub.AudioSegment.from_wav(io.BytesIO(audio_bytes))
+    sound.export(audio, format="mp3")
+    audio.seek(0)
+
+    message_parts = [
+        {
+            "mime_type": "audio/mp3",
+            "data": base64.b64encode(audio.read()).decode("utf-8")
+        }
+    ]
+    context.add_message("user", message_parts)
+    try:
+        logger.info("on_message: Appel de generate_response")
+        response = generate_response(context.get_context(), context.model_name, context.system_prompt)
+        response_text = ""
+        sent_message = None
+        logger.info("on_message: Début de la boucle de réception des chunks")
+        for chunk in response:
+            logger.info(f"on_message: Chunk reçu: {chunk.text}")
+            if sent_message and len(response_text) + len(chunk.text) > DISCORD_MESSAGE_LENGTH_LIMIT - 3:
+                logger.info("on_message: Envoi du message actuel car le prochain chunk ferait dépasser la limite")
+                await sent_message.edit(content=response_text)
+                sent_message = await ctx.channel.send("...")
+                response_text = ""
+            response_text += chunk.text
+            if sent_message:
+                if len(response_text) <= DISCORD_MESSAGE_LENGTH_LIMIT - 3:
+                    await sent_message.edit(content=response_text + "...")
+                else:
+                    await sent_message.edit(content=response_text)
+                    sent_message = None
+                    response_text = ""
+            else:
+                sent_message = await ctx.channel.send(response_text + "...")
+            await asyncio.sleep(0.5)
+        logger.info("on_message: Fin de la boucle de réception des chunks")
+        if sent_message:
+            if response_text:
+                await sent_message.edit(content=response_text)
+                await play_tts(voice_clients[ctx.guild.id], response_text)
+            else:
+                await sent_message.delete()
+        elif response_text:
+            await ctx.channel.send(response_text)
+            await play_tts(voice_clients[ctx.guild.id], response_text)
+        logger.info(f"on_message: Ajout de la réponse au contexte: {response_text}")
+        context.add_message("model", response_text)
+    except Exception as e:
+        logger.error(f"on_message: Une erreur est survenue: {e}")
+        error_message = handle_api_error(e)
+        await ctx.channel.send(f"Une erreur est survenue: {error_message}")
+
 class BotCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.attachment_handler = MessageAttachment()
         setup_gemini_api()
-        
+
     @commands.Cog.listener()
     async def on_ready(self):
         logger.info(f"{self.bot.user} est prêt et connecté à Discord!")
         setup_gemini_api()
-    
+
     @commands.Cog.listener()
     async def on_message(self, message):
         if message.author.bot:
@@ -176,6 +234,11 @@ class BotCommands(commands.Cog):
             activated_channels.remove(ctx.channel.id)
             if ctx.channel.id in tts_enabled_channels:
                 tts_enabled_channels.remove(ctx.channel.id)
+                await leave_voice_channel(ctx.guild.id, voice_clients)
+            if ctx.channel.id in voice_chat_channels:
+                voice_client = voice_chat_channels[ctx.channel.id]
+                voice_client.stop_recording()
+                del voice_chat_channels[ctx.channel.id]
                 await leave_voice_channel(ctx.guild.id, voice_clients)
             if ctx.channel.id in channel_contexts:
                 del channel_contexts[ctx.channel.id]
@@ -312,6 +375,38 @@ class BotCommands(commands.Cog):
                 await ctx.send("Lecture vocale activée pour ce canal.")
             else:
                 await ctx.send("Impossible de rejoindre le canal vocal.")
-                
+
+    @commands.command(name="voice_chat", help="Active/désactive le chat vocal dans le channel courant.")
+    async def voice_chat(self, ctx):
+        logger.info(f"'voice_chat' command exécutée par {ctx.author} dans le channel {ctx.channel.id}")
+        if ctx.channel.id not in activated_channels:
+            await ctx.send("Le bot n'est pas activé dans ce canal. Utilisez d'abord ?activer")
+            return
+
+        if not ctx.author.voice:
+            await ctx.send("Vous devez être dans un canal vocal pour utiliser cette commande.")
+            return
+
+        if ctx.channel.id in voice_chat_channels:
+            voice_client = voice_chat_channels[ctx.channel.id]
+            voice_client.stop_recording()
+            del voice_chat_channels[ctx.channel.id]
+            await leave_voice_channel(ctx.guild.id, voice_clients)
+            await ctx.send("Chat vocal désactivé pour ce canal.")
+        else:
+            voice_client = await join_voice_channel(ctx.author.voice.channel)
+            if voice_client:
+                voice_clients[ctx.guild.id] = voice_client
+                voice_chat_channels[ctx.channel.id] = voice_client
+
+                sink = GlobalSilenceWatcher(callback=lambda buffer: on_audio_data_ready(buffer, ctx))
+
+                await start_recording(voice_client, sink, ctx.channel.id)
+                asyncio.create_task(sink.check_silence())
+
+                await ctx.send("Chat vocal activé pour ce canal.")
+            else:
+                await ctx.send("Impossible de rejoindre le canal vocal.")
+
 def setup_bot(bot):
     bot.add_cog(BotCommands(bot))
