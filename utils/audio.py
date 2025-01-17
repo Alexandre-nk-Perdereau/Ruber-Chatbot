@@ -58,7 +58,7 @@ async def play_tts(voice_client, text):
         logger.error(f"Erreur lors de la lecture TTS: {e}")
 
 class GlobalSilenceWatcher(discord.sinks.WaveSink):
-    def __init__(self, callback, timeout=4.0, min_duration=0.2, volume_threshold=0.05):
+    def __init__(self, callback, timeout=3.0, min_duration=0.5, volume_threshold=0.20):
         super().__init__()
         self.callback = callback
         self.timeout = timeout
